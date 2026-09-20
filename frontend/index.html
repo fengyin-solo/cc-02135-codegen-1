@@ -54,6 +54,99 @@
             <div id="mySharesList" class="share-list"></div>
         </div>
 
+        <!-- 文件预览与元数据 -->
+        <div id="previewSection" class="preview-section" style="display: none;">
+            <div class="preview-header">
+                <button class="preview-back-btn" onclick="goBackToDirectory()">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <line x1="19" y1="12" x2="5" y2="12"></line>
+                        <polyline points="12 19 5 12 12 5"></polyline>
+                    </svg>
+                    返回文件库
+                </button>
+            </div>
+
+            <!-- 预览加载态 -->
+            <div id="previewLoading" class="preview-state" style="display: none;">
+                <div class="spinner" style="margin: 40px auto;"></div>
+                <p id="previewLoadingText">正在加载文件信息...</p>
+            </div>
+
+            <!-- 预览错误/空态 -->
+            <div id="previewError" class="preview-state" style="display: none; text-align: center; padding: 40px 20px;">
+                <div style="font-size: 64px; margin-bottom: 16px;" id="previewErrorIcon">⚠️</div>
+                <h2 id="previewErrorTitle" style="text-transform: none; letter-spacing: normal; font-size: 1.25rem; margin-bottom: 8px;">无法预览</h2>
+                <p id="previewErrorMessage" style="color: var(--text-secondary); margin-bottom: 24px;">文件信息加载失败</p>
+                <button class="btn-primary" onclick="retryPreview()" style="border: none; display: inline-block; padding: 12px 32px;">重试</button>
+            </div>
+
+            <!-- 预览详情 -->
+            <div id="previewDetail" class="preview-detail" style="display: none;">
+                <div class="preview-file-head">
+                    <div class="file-icon" id="previewFileIcon">📁</div>
+                    <div class="preview-file-meta">
+                        <div class="file-name" id="previewFileName"></div>
+                        <div class="file-size" id="previewFileSize"></div>
+                    </div>
+                </div>
+
+                <div class="preview-meta-grid">
+                    <div class="preview-meta-item">
+                        <span class="preview-meta-label">文件类型</span>
+                        <span class="preview-meta-value" id="previewFileType"></span>
+                    </div>
+                    <div class="preview-meta-item">
+                        <span class="preview-meta-label">创建时间</span>
+                        <span class="preview-meta-value" id="previewCreatedAt"></span>
+                    </div>
+                    <div class="preview-meta-item">
+                        <span class="preview-meta-label">文件大小</span>
+                        <span class="preview-meta-value" id="previewFileSizeMeta"></span>
+                    </div>
+                </div>
+
+                <div class="preview-summary">
+                    <h2>内容摘要</h2>
+                    <pre id="previewSummaryText" class="preview-summary-text" style="display: none;"></pre>
+                    <p id="previewSummaryMessage" class="preview-summary-message" style="display: none;"></p>
+                    <div id="previewSummaryStats" class="preview-summary-stats" style="display: none;"></div>
+                </div>
+
+                <div class="preview-content-wrap">
+                    <h2>文件预览</h2>
+
+                    <!-- 文本加载态 -->
+                    <div id="previewContentLoading" class="preview-state" style="display: none;">
+                        <div class="spinner" style="margin: 32px auto;"></div>
+                        <p id="previewContentLoadingText">正在读取内容...</p>
+                    </div>
+
+                    <!-- 读取中断提示 -->
+                    <div id="previewContentInterrupted" class="preview-interrupted" style="display: none;">
+                        <p id="previewInterruptedText">读取中断</p>
+                        <button class="btn-secondary" onclick="resumePreview()" style="border: 1px solid var(--border); padding: 10px 24px;">从当前位置重试</button>
+                    </div>
+
+                    <pre id="previewTextContent" class="preview-text-content" style="display: none;"></pre>
+                    <img id="previewImageContent" class="preview-image-content" alt="文件预览" style="display: none;">
+                    <video id="previewVideoContent" class="preview-media-content" controls style="display: none;"></video>
+                    <audio id="previewAudioContent" class="preview-audio-content" controls style="display: none;"></audio>
+                    <iframe id="previewPdfContent" class="preview-pdf-content" title="PDF 预览" style="display: none;"></iframe>
+
+                    <!-- 不支持预览 / 空文件 / 数据缺失 -->
+                    <div id="previewContentNotice" class="preview-content-notice" style="display: none;">
+                        <div style="font-size: 48px; margin-bottom: 12px;" id="previewNoticeIcon">📦</div>
+                        <p id="previewNoticeText"></p>
+                    </div>
+                </div>
+
+                <div class="preview-actions">
+                    <button class="download-btn" id="previewDownloadBtn" onclick="requestDownloadFromPreview()">下载</button>
+                    <button class="share-btn" id="previewShareBtn" onclick="shareFromPreview()" style="display: none;">分享</button>
+                </div>
+            </div>
+        </div>
+
         <!-- 加载动画遮罩 -->
         <div id="loadingOverlay" class="loading-overlay">
             <div class="loader">

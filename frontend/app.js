@@ -4,6 +4,454 @@ const API_BASE = CONFIG.API_BASE;
 let currentShareFileId = null;
 let currentShareLink = null;
 
+// ===== 文件预览控制 =====
+// 每次进入预览生成新的会话编号；过期会话的异步结果一律丢弃，
+// 保证连续打开不同文件时不会残留上一份结果。
+const PreviewController = {
+    session: 0,
+    fileId: null,
+    metadata: null,
+    textOffset: 0,
+    textTotal: null,
+    textBuffer: '',
+    textAbort: null,
+    mediaUrl: null,
+
+    reset() {
+        this.session++;
+        this.fileId = null;
+        this.metadata = null;
+        this.textOffset = 0;
+        this.textTotal = null;
+        this.textBuffer = '';
+        this.abortTextLoad();
+        this.revokeMediaUrl();
+    },
+
+    abortTextLoad() {
+        if (this.textAbort) {
+            this.textAbort.abort();
+            this.textAbort = null;
+        }
+    },
+
+    revokeMediaUrl() {
+        if (this.mediaUrl) {
+            window.URL.revokeObjectURL(this.mediaUrl);
+            this.mediaUrl = null;
+        }
+    }
+};
+
+// 将预览相关的展示节点恢复到初始（隐藏）状态
+function resetPreviewDom() {
+    ['previewLoading', 'previewError', 'previewDetail',
+     'previewContentLoading', 'previewContentInterrupted',
+     'previewTextContent', 'previewImageContent', 'previewVideoContent',
+     'previewAudioContent', 'previewPdfContent', 'previewContentNotice',
+     'previewSummaryText', 'previewSummaryMessage', 'previewSummaryStats'
+    ].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.style.display = 'none';
+    });
+    const img = document.getElementById('previewImageContent');
+    const video = document.getElementById('previewVideoContent');
+    const audio = document.getElementById('previewAudioContent');
+    const pdf = document.getElementById('previewPdfContent');
+    if (img) img.removeAttribute('src');
+    if (video) { video.removeAttribute('src'); video.load(); }
+    if (audio) { audio.removeAttribute('src'); audio.load(); }
+    if (pdf) pdf.removeAttribute('src');
+    document.getElementById('previewTextContent').textContent = '';
+}
+
+// 目录视图与预览视图切换
+function showDirectoryView() {
+    document.body.classList.remove('preview-mode');
+    document.getElementById('previewSection').style.display = 'none';
+}
+
+function showPreviewView() {
+    document.body.classList.add('preview-mode');
+    const section = document.getElementById('previewSection');
+    section.style.display = 'block';
+    window.scrollTo(0, 0);
+}
+
+// 从文件目录进入预览
+function openPreview(fileId) {
+    window.location.hash = `preview/${encodeURIComponent(fileId)}`;
+}
+
+// 返回文件目录
+function goBackToDirectory() {
+    // 统一通过清空 hash 回到目录，避免在直接打开预览链接时 history.back() 离开站点
+    if (window.location.hash) {
+        window.location.hash = '';
+    } else {
+        showDirectoryView();
+    }
+}
+
+// 预览页“下载”：复用既有取件流程（含身份验证弹窗）
+function requestDownloadFromPreview() {
+    if (PreviewController.fileId) {
+        requestDownload(PreviewController.fileId);
+    }
+}
+
+// 预览页“分享”：复用既有协作能力
+function shareFromPreview() {
+    if (!PreviewController.metadata) return;
+    openShareModal(PreviewController.metadata.id, PreviewController.metadata.name);
+}
+
+// 元数据加载失败后的整页重试
+function retryPreview() {
+    if (PreviewController.fileId) {
+        loadPreview(PreviewController.fileId);
+    }
+}
+
+// 读取中断后从当前位置继续
+function resumePreview() {
+    if (PreviewController.metadata && PreviewController.metadata.file_type === 'text') {
+        loadTextPreview(PreviewController.session, PreviewController.metadata);
+    }
+}
+
+// 显示预览整页错误/空态
+function showPreviewError(title, message, icon = '⚠️', retryable = true) {
+    resetPreviewDom();
+    document.getElementById('previewLoading').style.display = 'none';
+    document.getElementById('previewError').style.display = 'block';
+    document.getElementById('previewErrorTitle').textContent = title;
+    document.getElementById('previewErrorMessage').textContent = message;
+    document.getElementById('previewErrorIcon').textContent = icon;
+    const retryBtn = document.querySelector('#previewError button');
+    if (retryBtn) retryBtn.style.display = retryable ? 'inline-block' : 'none';
+}
+
+// 加载文件元数据与摘要
+async function loadPreview(fileId) {
+    const session = PreviewController.session + 1;
+    PreviewController.reset();
+    PreviewController.session = session;
+    PreviewController.fileId = fileId;
+
+    showPreviewView();
+    resetPreviewDom();
+    document.getElementById('previewLoading').style.display = 'block';
+    document.getElementById('previewLoadingText').textContent = '正在加载文件信息...';
+
+    let metadata;
+    try {
+        const response = await fetch(`${API_BASE}/files/${encodeURIComponent(fileId)}`, {
+            cache: 'no-store'
+        });
+        if (session !== PreviewController.session) return;
+
+        if (response.status === 404) {
+            showPreviewError('文件不存在', '该文件可能已被删除，请返回文件库查看最新列表', '📂', false);
+            return;
+        }
+        if (!response.ok) {
+            const result = await response.json().catch(() => ({}));
+            showPreviewError('无法预览', result.error || `文件信息加载失败（HTTP ${response.status}）`);
+            return;
+        }
+        metadata = await response.json();
+    } catch (error) {
+        if (session !== PreviewController.session) return;
+        showPreviewError('加载失败', `无法加载文件信息：${error.message}，请检查网络后重试`);
+        return;
+    }
+
+    if (session !== PreviewController.session) return;
+    renderPreviewMetadata(session, metadata);
+}
+
+// 渲染元数据、摘要与可用操作
+async function renderPreviewMetadata(session, metadata) {
+    PreviewController.metadata = metadata;
+
+    resetPreviewDom();
+    document.getElementById('previewLoading').style.display = 'none';
+    document.getElementById('previewError').style.display = 'none';
+    document.getElementById('previewDetail').style.display = 'block';
+
+    document.getElementById('previewFileIcon').textContent = getFileIcon(metadata.name);
+    document.getElementById('previewFileName').textContent = metadata.name;
+    document.getElementById('previewFileSize').textContent = formatSize(metadata.size);
+    document.getElementById('previewFileType').textContent = metadata.type_label;
+    document.getElementById('previewCreatedAt').textContent = formatCreatedAt(metadata.created_at);
+    document.getElementById('previewFileSizeMeta').textContent = formatSize(metadata.size);
+
+    renderSummary(metadata.summary);
+
+    // 可用操作：下载始终可用（沿用鉴权流程），分享仅登录用户可见
+    const isLoggedIn = !!(TokenManager.get() && (await TokenManager.isValid()));
+    if (session !== PreviewController.session) return;
+    document.getElementById('previewShareBtn').style.display = isLoggedIn ? 'inline-flex' : 'none';
+
+    // 文件数据缺失：展示一致的失败说明，不发起内容读取
+    if (!metadata.available) {
+        showContentNotice('🗂️', metadata.summary && metadata.summary.message
+            ? metadata.summary.message
+            : '文件数据缺失或已被移除，暂时无法预览');
+        return;
+    }
+
+    loadPreviewContent(session, metadata);
+}
+
+function renderSummary(summary) {
+    if (!summary) return;
+    const textEl = document.getElementById('previewSummaryText');
+    const msgEl = document.getElementById('previewSummaryMessage');
+    const statsEl = document.getElementById('previewSummaryStats');
+
+    if (summary.text) {
+        textEl.style.display = 'block';
+        textEl.textContent = summary.text + (summary.truncated ? '\n…' : '');
+    }
+
+    const message = summary.message || (summary.kind === 'text' && summary.text === '' ? '文件内容为空' : null);
+    if (message) {
+        msgEl.style.display = 'block';
+        msgEl.textContent = message;
+    }
+
+    if (summary.kind === 'text' && summary.lines !== null) {
+        statsEl.style.display = 'block';
+        statsEl.textContent = `共 ${summary.lines} 行 · ${summary.chars} 字符${summary.truncated ? ' · 仅展示文件开头部分' : ''}`;
+    }
+}
+
+function showContentNotice(icon, text) {
+    document.getElementById('previewContentLoading').style.display = 'none';
+    document.getElementById('previewContentInterrupted').style.display = 'none';
+    document.getElementById('previewContentNotice').style.display = 'flex';
+    document.getElementById('previewNoticeIcon').textContent = icon;
+    document.getElementById('previewNoticeText').textContent = text;
+}
+
+// 根据文件类型加载预览内容
+function loadPreviewContent(session, metadata) {
+    if (metadata.size === 0) {
+        showContentNotice('📄', '文件内容为空');
+        return;
+    }
+    switch (metadata.file_type) {
+        case 'text':
+            PreviewController.textOffset = 0;
+            PreviewController.textTotal = null;
+            PreviewController.textBuffer = '';
+            loadTextPreview(session, metadata);
+            break;
+        case 'image':
+            loadDirectMedia(session, metadata, 'previewImageContent', '🖼️');
+            break;
+        case 'video':
+            loadDirectMedia(session, metadata, 'previewVideoContent', '🎬');
+            break;
+        case 'audio':
+            loadDirectMedia(session, metadata, 'previewAudioContent', '🎵');
+            break;
+        case 'pdf':
+            ensurePreviewAvailable(session, metadata, 'previewPdfContent', '📄');
+            break;
+        default:
+            showContentNotice('📦', '该文件类型暂不支持在线预览，请点击下方“下载”获取文件');
+    }
+}
+
+// 每块读取 256KB，配合 Range 请求实现中断保留位置
+const TEXT_CHUNK_BYTES = 256 * 1024;
+
+// 文本预览：按字节分块读取；中断后保留已读位置，可从断点重试
+async function loadTextPreview(session, metadata) {
+    const loadingEl = document.getElementById('previewContentLoading');
+    const interruptedEl = document.getElementById('previewContentInterrupted');
+    const textEl = document.getElementById('previewTextContent');
+
+    interruptedEl.style.display = 'none';
+    loadingEl.style.display = 'block';
+    document.getElementById('previewContentLoadingText').textContent =
+        PreviewController.textOffset > 0 ? '正在从断点继续读取...' : '正在读取内容...';
+
+    const start = PreviewController.textOffset;
+    const end = start + TEXT_CHUNK_BYTES - 1;
+    const controller = new AbortController();
+    PreviewController.textAbort = controller;
+
+    try {
+        const response = await fetch(
+            `${API_BASE}/files/${encodeURIComponent(metadata.id)}/preview`,
+            {
+                cache: 'no-store',
+                signal: controller.signal,
+                headers: { 'Range': `bytes=${start}-${end}` }
+            }
+        );
+        if (session !== PreviewController.session) return;
+
+        if (!response.ok && response.status !== 206) {
+            const result = await response.json().catch(() => ({}));
+            throw new Error(result.error || `读取失败（HTTP ${response.status}）`);
+        }
+
+        const chunk = await response.text();
+        if (session !== PreviewController.session) return;
+
+        const total = parseInt(response.headers.get('X-Content-Total') || '0', 10);
+        const chunkStart = parseInt(response.headers.get('X-Content-Start') || String(start), 10);
+        const chunkEnd = parseInt(response.headers.get('X-Content-End') || '-1', 10);
+        PreviewController.textTotal = total;
+        PreviewController.textBuffer += chunk;
+        PreviewController.textOffset = chunkEnd >= 0
+            ? chunkEnd + 1
+            : chunkStart + new Blob([chunk]).size;
+
+        loadingEl.style.display = 'none';
+        textEl.style.display = 'block';
+        const hasMore = PreviewController.textTotal !== null
+            ? PreviewController.textOffset < PreviewController.textTotal
+            : chunk.length >= TEXT_CHUNK_BYTES;
+        textEl.textContent = PreviewController.textBuffer + (hasMore ? '\n…' : '');
+
+        if (hasMore) {
+            // 继续读取下一块，直到读完
+            loadTextPreview(session, metadata);
+        }
+    } catch (error) {
+        if (session !== PreviewController.session) return;
+        if (error.name === 'AbortError') return;
+
+        // 读取中断：保留当前位置（textOffset 不变），已读内容仍可见，可从断点重试
+        loadingEl.style.display = 'none';
+        if (PreviewController.textBuffer) {
+            textEl.style.display = 'block';
+            textEl.textContent = PreviewController.textBuffer + '\n…';
+        }
+        interruptedEl.style.display = 'flex';
+        document.getElementById('previewInterruptedText').textContent =
+            `读取中断（已读取 ${formatSize(PreviewController.textOffset)}${
+                PreviewController.textTotal ? ' / ' + formatSize(PreviewController.textTotal) : ''
+            }）：${error.message}`;
+    } finally {
+        if (PreviewController.textAbort === controller) {
+            PreviewController.textAbort = null;
+        }
+    }
+}
+
+// 图片/音视频：直接以接口地址作为媒体源，浏览器原生支持 Range 缓冲与拖动续读
+function loadDirectMedia(session, metadata, elementId, icon) {
+    const loadingEl = document.getElementById('previewContentLoading');
+    loadingEl.style.display = 'block';
+    document.getElementById('previewContentLoadingText').textContent = '正在加载预览内容...';
+
+    const el = document.getElementById(elementId);
+    const url = `${API_BASE}/files/${encodeURIComponent(metadata.id)}/preview`;
+
+    const onReady = () => {
+        if (session !== PreviewController.session) return;
+        loadingEl.style.display = 'none';
+        el.style.display = 'block';
+    };
+    const onError = () => {
+        if (session !== PreviewController.session) return;
+        loadingEl.style.display = 'none';
+        showContentNotice(icon, '预览加载失败，可返回重试或下载后查看');
+    };
+
+    // img/iframe 使用 load/error；audio/video 使用 loadeddata/error
+    el.onload = onReady;
+    el.onerror = onError;
+    if (el.tagName === 'VIDEO' || el.tagName === 'AUDIO') {
+        el.onload = null;
+        el.addEventListener('loadeddata', onReady, { once: true });
+        el.addEventListener('error', onError, { once: true });
+    }
+
+    el.style.display = 'none';
+    el.src = url;
+}
+
+// iframe（PDF）无统一错误事件，先探测接口可用性再交给浏览器内置查看器
+async function ensurePreviewAvailable(session, metadata, elementId, icon) {
+    const loadingEl = document.getElementById('previewContentLoading');
+    loadingEl.style.display = 'block';
+    document.getElementById('previewContentLoadingText').textContent = '正在加载 PDF...';
+
+    const controller = new AbortController();
+    PreviewController.textAbort = controller;
+    try {
+        const response = await fetch(
+            `${API_BASE}/files/${encodeURIComponent(metadata.id)}/preview`,
+            { method: 'HEAD', cache: 'no-store', signal: controller.signal }
+        );
+        if (session !== PreviewController.session) return;
+        if (!response.ok) {
+            const result = await response.json().catch(() => ({}));
+            throw new Error(result.error || `HTTP ${response.status}`);
+        }
+        loadingEl.style.display = 'none';
+        loadDirectMedia(session, metadata, elementId, icon);
+    } catch (error) {
+        if (session !== PreviewController.session) return;
+        if (error.name === 'AbortError') return;
+        loadingEl.style.display = 'none';
+        showContentNotice(icon, `PDF 预览加载失败：${error.message}`);
+    } finally {
+        if (PreviewController.textAbort === controller) {
+            PreviewController.textAbort = null;
+        }
+    }
+}
+
+// 格式化文件创建时间（兼容 SQLite 的 "YYYY-MM-DD HH:MM:SS" UTC 时间）
+function formatCreatedAt(value) {
+    if (!value) return '未知';
+    let date;
+    if (typeof value === 'number') {
+        date = new Date(value * 1000);
+    } else if (typeof value === 'string' && value.includes(' ') && !value.includes('T')) {
+        date = new Date(value.replace(' ', 'T') + 'Z');
+    } else {
+        date = new Date(value);
+    }
+    if (isNaN(date.getTime())) return String(value);
+    return date.toLocaleString('zh-CN', {
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit'
+    });
+}
+
+// 基于 hash 的简单路由：#preview/<fileId> 进入预览，其余为目录
+function handleRoute() {
+    const match = window.location.hash.match(/^#preview\/(.+)$/);
+    if (match) {
+        const fileId = decodeURIComponent(match[1]);
+        // 同一文件重复进入（如目录数据变化后）也重新拉取，保证元数据一致
+        loadPreview(fileId);
+    } else {
+        const wasInPreview = PreviewController.fileId !== null;
+        PreviewController.reset();
+        showDirectoryView();
+        // 从预览返回目录时静默刷新，确保目录与最新数据一致
+        if (wasInPreview) loadFileList(true);
+    }
+}
+
+window.addEventListener('hashchange', handleRoute);
+window.addEventListener('pageshow', () => {
+    if (window.location.hash.startsWith('#preview/')) {
+        handleRoute();
+    }
+});
+
 // Token 管理
 const TokenManager = {
     TOKEN_KEY: 'auth_token',
@@ -76,6 +524,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         TokenManager.clear();
     }
     await updateUserBar();
+    // 若直接以 #preview/<id> 打开，则由路由进入预览（目录列表仍在后台加载）
+    handleRoute();
     loadFileList();
 });
 
@@ -152,16 +602,16 @@ uploadZone.addEventListener('drop', async (e) => {
 });
 
 // 加载文件列表
-async function loadFileList() {
-    showLoading('加载文件列表...');
-    
+async function loadFileList(silent = false) {
+    if (!silent) showLoading('加载文件列表...');
+
     try {
         const response = await fetch(`${API_BASE}/files`);
         const files = await response.json();
-        
+
         const fileList = document.getElementById('fileList');
         const isLoggedIn = TokenManager.get() && (await TokenManager.isValid());
-        
+
         if (files.length === 0) {
             fileList.innerHTML = '<p class="empty-msg">暂无可下载文件</p>';
         } else {
@@ -175,6 +625,9 @@ async function loadFileList() {
                         </div>
                     </div>
                     <div class="file-actions">
+                        <button class="preview-btn" onclick="openPreview('${escapeHtml(file.id)}')" title="预览文件与元数据">
+                            预览
+                        </button>
                         ${isLoggedIn ? `<button class="share-btn" onclick="openShareModal('${escapeHtml(file.id)}', '${escapeHtml(file.name)}')">分享</button>` : ''}
                         <button class="download-btn" onclick="requestDownload('${escapeHtml(file.id)}')">
                             下载
@@ -184,10 +637,10 @@ async function loadFileList() {
             `).join('');
         }
     } catch (error) {
-        document.getElementById('fileList').innerHTML = 
+        document.getElementById('fileList').innerHTML =
             `<p class="empty-msg">加载失败: ${escapeHtml(error.message)}</p>`;
     } finally {
-        hideLoading();
+        if (!silent) hideLoading();
     }
 }
 

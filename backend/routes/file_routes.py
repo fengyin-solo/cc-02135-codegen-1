@@ -4,12 +4,13 @@ import re
 import uuid
 import time
 import logging
-from flask import request, jsonify, send_file
+from flask import request, jsonify, send_file, Response
 from werkzeug.utils import secure_filename
 from routes import files_bp
 from database import get_db
 from auth import verify_token, get_username_from_token, login_required
 from config import UPLOAD_FOLDER, MAX_FILE_SIZE, BLOCKED_EXTENSIONS, SHARE_LINK_EXPIRE_HOURS, SHARE_LINK_MAX_DOWNLOADS
+import preview_service
 
 logger = logging.getLogger(__name__)
 
@@ -72,10 +73,118 @@ def upload_file():
 def list_files():
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute('SELECT id, name, path, size FROM files')
-    files = [dict(row) for row in cursor.fetchall()]
+    cursor.execute('SELECT id, name, path, size, uploaded_at FROM files ORDER BY uploaded_at DESC')
+    files = []
+    for row in cursor.fetchall():
+        item = dict(row)
+        # 对外统一使用 created_at 表达创建时间
+        item['created_at'] = item.get('uploaded_at')
+        files.append(item)
     conn.close()
     return jsonify(files)
+
+
+def _get_file_row(file_id):
+    """按 ID 查询文件记录，不存在返回 None"""
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        'SELECT id, name, path, size, uploaded_at FROM files WHERE id = ?',
+        (file_id,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return row
+
+
+@files_bp.route('/api/files/<file_id>', methods=['GET'])
+def get_file_metadata(file_id):
+    """获取文件元数据与内容摘要（公开只读，不涉及文件内容下载）"""
+    file_row = _get_file_row(file_id)
+    if not file_row:
+        return jsonify({'error': '文件不存在'}), 404
+
+    metadata = preview_service.build_file_metadata(file_row, file_row['path'])
+    return jsonify(metadata)
+
+
+@files_bp.route('/api/files/<file_id>/preview', methods=['GET'])
+def preview_file(file_id):
+    """读取预览内容
+
+    - 公开可读：预览仅展示文件自身内容，下载仍走鉴权流程
+    - 支持 Range（Range 头或 ?start=），读取中断后可从断点继续
+    - 不支持预览的类型返回 415，由界面给出说明
+    """
+    file_row = _get_file_row(file_id)
+    if not file_row:
+        return jsonify({'error': '文件不存在'}), 404
+
+    filepath = file_row['path']
+    if not os.path.abspath(filepath).startswith(os.path.abspath(UPLOAD_FOLDER)):
+        return jsonify({'error': '非法文件路径'}), 403
+
+    if not os.path.exists(filepath):
+        return jsonify({'error': '文件数据缺失或已被移除'}), 410
+
+    if not preview_service.is_previewable(file_row['name']):
+        return jsonify({'error': '该文件类型暂不支持在线预览'}), 415
+
+    file_size = os.path.getsize(filepath)
+    if file_size > preview_service.MAX_PREVIEW_BYTES:
+        return jsonify({'error': '文件过大，无法在线预览，请下载后查看'}), 413
+
+    mime_type = preview_service.get_mime_type(file_row['name'])
+
+    # 断点续传：优先使用标准 Range 头，兼容 ?start= 查询参数
+    range_header = request.headers.get('Range', '')
+    byte_range = preview_service.parse_range(range_header, file_size)
+
+    if range_header and byte_range is None:
+        return jsonify({'error': '请求的范围超出文件大小'}), 416
+
+    if byte_range is None and request.args.get('start') is not None:
+        try:
+            start = max(0, int(request.args.get('start')))
+        except (TypeError, ValueError):
+            start = 0
+        if start < file_size:
+            byte_range = (start, file_size - 1)
+        elif file_size == 0:
+            byte_range = None
+        else:
+            return jsonify({'error': '请求的范围超出文件大小'}), 416
+
+    if file_size == 0:
+        response = Response(b'', status=200, content_type=mime_type)
+    elif byte_range is None:
+        data = preview_service.read_range(filepath, 0, file_size - 1)
+        response = Response(data, status=200, content_type=mime_type)
+        response.headers['Content-Length'] = str(len(data))
+    else:
+        start, end = byte_range
+        # 文本类型按字符边界对齐，避免分块切断多字节字符
+        if preview_service.classify_file(file_row['name']) == 'text':
+            start, end = preview_service.align_text_range(filepath, start, end)
+        if end < start:
+            # 对齐后该区间为空内容（多字节字符整体落在其他分块）
+            data = b''
+        else:
+            data = preview_service.read_range(filepath, start, end)
+        response = Response(data, status=206, content_type=mime_type)
+        response.headers['Content-Range'] = f'bytes {start}-{end}/{file_size}'
+        response.headers['Content-Length'] = str(len(data))
+        response.headers['Accept-Ranges'] = 'bytes'
+        # 便于前端解析当前读取位置
+        response.headers['X-Content-Start'] = str(start)
+        response.headers['X-Content-End'] = str(end)
+        response.headers['X-Content-Total'] = str(file_size)
+
+    # 内联展示而非下载；禁止浏览器嗅探，防止文本被当作 HTML 执行
+    response.headers['Content-Disposition'] = 'inline'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['Cache-Control'] = 'no-store'
+    return response
 
 
 @files_bp.route('/api/download/<file_id>', methods=['GET'])
