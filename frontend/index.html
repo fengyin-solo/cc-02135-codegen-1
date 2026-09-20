@@ -24,34 +24,129 @@
             </span>
         </div>
 
-        <h1>CloudVault</h1>
-        <p class="subtitle">安全、快速、可靠的文件传输平台</p>
-        
-        <!-- 上传区域 -->
-        <div class="upload-section">
-            <h2>上传文件</h2>
-            <div class="upload-zone" onclick="document.getElementById('fileInput').click()">
-                <div class="upload-icon">☁️</div>
-                <p class="upload-text">拖放文件到此处，或点击选择</p>
-                <p class="upload-hint">支持 PDF、图片、文档、压缩包等格式，最大 50MB</p>
+        <!-- ============ 文件目录视图 ============ -->
+        <div id="directoryView">
+            <h1>CloudVault</h1>
+            <p class="subtitle">安全、快速、可靠的文件传输平台</p>
+
+            <!-- 上传区域 -->
+            <div class="upload-section">
+                <h2>上传文件</h2>
+                <div class="upload-zone" onclick="document.getElementById('fileInput').click()">
+                    <div class="upload-icon">☁️</div>
+                    <p class="upload-text">拖放文件到此处，或点击选择</p>
+                    <p class="upload-hint">支持 PDF、图片、文档、压缩包等格式，最大 50MB</p>
+                </div>
+                <input type="file" id="fileInput" hidden>
+                <button class="upload-btn" onclick="document.getElementById('fileInput').click()">
+                    <span>选择文件</span>
+                </button>
+                <div id="uploadStatus"></div>
             </div>
-            <input type="file" id="fileInput" hidden>
-            <button class="upload-btn" onclick="document.getElementById('fileInput').click()">
-                <span>选择文件</span>
-            </button>
-            <div id="uploadStatus"></div>
+
+            <!-- 文件列表 -->
+            <div class="file-list-section">
+                <h2>文件库</h2>
+                <div id="fileList" class="file-list"></div>
+            </div>
+
+            <!-- 我的分享 -->
+            <div id="mySharesSection" class="file-list-section" style="display: none;">
+                <h2>我的分享</h2>
+                <div id="mySharesList" class="share-list"></div>
+            </div>
         </div>
 
-        <!-- 文件列表 -->
-        <div class="file-list-section">
-            <h2>文件库</h2>
-            <div id="fileList" class="file-list"></div>
-        </div>
+        <!-- ============ 文件预览与元数据视图 ============ -->
+        <div id="previewView" class="preview-view" style="display: none;">
+            <div class="preview-topbar">
+                <button type="button" class="back-btn" onclick="backToDirectory()">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <line x1="19" y1="12" x2="5" y2="12"></line>
+                        <polyline points="12 19 5 12 12 5"></polyline>
+                    </svg>
+                    返回文件目录
+                </button>
+            </div>
 
-        <!-- 我的分享 -->
-        <div id="mySharesSection" class="file-list-section" style="display: none;">
-            <h2>我的分享</h2>
-            <div id="mySharesList" class="share-list"></div>
+            <div id="previewCard" class="file-list-section preview-card">
+                <!-- 元数据加载中 -->
+                <div id="previewMetaLoading" class="preview-state">
+                    <div class="spinner"></div>
+                    <p>正在加载文件信息…</p>
+                </div>
+
+                <!-- 文件不存在 / 已删除 -->
+                <div id="previewMissing" class="preview-state" style="display: none;">
+                    <div class="preview-state-icon">⚠️</div>
+                    <h2 class="preview-state-title" id="previewMissingTitle">文件不存在</h2>
+                    <p class="empty-msg" id="previewMissingMsg">该文件已被删除或分享已失效，请返回文件目录查看最新文件。</p>
+                    <button type="button" class="upload-btn" onclick="backToDirectory()">
+                        <span>返回文件目录</span>
+                    </button>
+                </div>
+
+                <!-- 元数据加载失败（可重试，保留当前位置） -->
+                <div id="previewMetaError" class="preview-state" style="display: none;">
+                    <div class="preview-state-icon">📡</div>
+                    <h2 class="preview-state-title">文件信息加载失败</h2>
+                    <p class="empty-msg" id="previewMetaErrorMsg"></p>
+                    <button type="button" class="upload-btn" onclick="PreviewController.retryMeta()">
+                        <span>重试</span>
+                    </button>
+                </div>
+
+                <!-- 正常内容 -->
+                <div id="previewBody" style="display: none;">
+                    <div class="preview-header">
+                        <div class="file-icon preview-header-icon" id="previewFileIcon">📁</div>
+                        <div class="preview-heading">
+                            <div class="file-name" id="previewName"></div>
+                            <div class="file-size" id="previewSizeLine"></div>
+                        </div>
+                    </div>
+
+                    <div class="preview-meta-grid">
+                        <div class="preview-meta-item">
+                            <span class="preview-meta-label">文件类型</span>
+                            <span class="preview-meta-value" id="previewType"></span>
+                        </div>
+                        <div class="preview-meta-item">
+                            <span class="preview-meta-label">创建时间</span>
+                            <span class="preview-meta-value" id="previewCreatedAt"></span>
+                        </div>
+                        <div class="preview-meta-item">
+                            <span class="preview-meta-label">文件大小</span>
+                            <span class="preview-meta-value" id="previewSize"></span>
+                        </div>
+                        <div class="preview-meta-item preview-meta-item-wide">
+                            <span class="preview-meta-label">内容摘要</span>
+                            <span class="preview-meta-value" id="previewSummary"></span>
+                        </div>
+                    </div>
+
+                    <div class="preview-actions" id="previewActions"></div>
+
+                    <div class="preview-content-wrap">
+                        <h2>内容预览</h2>
+                        <!-- 预览读取中 -->
+                        <div id="previewContentLoading" class="preview-state preview-content-state" style="display: none;">
+                            <div class="spinner"></div>
+                            <p>正在读取文件内容…</p>
+                        </div>
+                        <!-- 预览失败 / 不支持 -->
+                        <div id="previewContentError" class="preview-state preview-content-state" style="display: none;">
+                            <div class="preview-state-icon" id="previewErrorIcon">⚠️</div>
+                            <p class="empty-msg" id="previewErrorMsg"></p>
+                            <button type="button" class="upload-btn" id="previewRetryBtn">
+                                <span>重试读取</span>
+                            </button>
+                        </div>
+                        <!-- 预览内容挂载点 -->
+                        <div id="previewContent" class="preview-content"></div>
+                    </div>
+                </div>
+            </div>
         </div>
 
         <!-- 加载动画遮罩 -->

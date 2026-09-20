@@ -76,7 +76,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         TokenManager.clear();
     }
     await updateUserBar();
-    loadFileList();
+
+    // hash 路由：#/file/<id> 进入文件预览页，其余为文件目录
+    window.addEventListener('hashchange', () => PreviewController.handleRoute());
+    PreviewController.handleRoute();
 });
 
 // 验证文件
@@ -109,7 +112,7 @@ async function uploadFile(file) {
         
         if (response.ok) {
             document.getElementById('uploadStatus').textContent = `✅ ${file.name} 上传成功！`;
-            loadFileList();
+            loadFileList(true);
         } else {
             document.getElementById('uploadStatus').textContent = `❌ 上传失败: ${result.error}`;
         }
@@ -151,30 +154,41 @@ uploadZone.addEventListener('drop', async (e) => {
     }
 });
 
-// 加载文件列表
-async function loadFileList() {
+// 加载文件列表（force=true 时忽略“距上次加载很近”的短路，目录返回时保证数据最新）
+let _fileListLoadedAt = 0;
+async function loadFileList(force = false) {
+    // 目录视图隐藏时不必刷新；数据一致性由重新进入目录时的强制刷新保证
+    if (!force && Date.now() - _fileListLoadedAt < 3000 &&
+        document.getElementById('directoryView').style.display !== 'none') {
+        return;
+    }
+
     showLoading('加载文件列表...');
-    
+
     try {
         const response = await fetch(`${API_BASE}/files`);
         const files = await response.json();
-        
+        _fileListLoadedAt = Date.now();
+
         const fileList = document.getElementById('fileList');
         const isLoggedIn = TokenManager.get() && (await TokenManager.isValid());
-        
+
         if (files.length === 0) {
             fileList.innerHTML = '<p class="empty-msg">暂无可下载文件</p>';
         } else {
             fileList.innerHTML = files.map(file => `
                 <div class="file-item">
-                    <div class="file-info">
+                    <button type="button" class="file-info file-info-entry" onclick="openPreview('${encodeURIComponent(file.id)}')" title="查看文件预览与元数据">
                         <div class="file-icon">${getFileIcon(file.name)}</div>
                         <div class="file-details">
                             <div class="file-name">${escapeHtml(file.name)}</div>
-                            <div class="file-size">${formatSize(file.size)}</div>
+                            <div class="file-size">${formatSize(file.size)}${file.uploaded_at ? ` · 上传于 ${formatDateTime(file.uploaded_at)}` : ''}</div>
                         </div>
-                    </div>
+                    </button>
                     <div class="file-actions">
+                        <button class="preview-entry-btn" onclick="openPreview('${encodeURIComponent(file.id)}')">
+                            预览
+                        </button>
                         ${isLoggedIn ? `<button class="share-btn" onclick="openShareModal('${escapeHtml(file.id)}', '${escapeHtml(file.name)}')">分享</button>` : ''}
                         <button class="download-btn" onclick="requestDownload('${escapeHtml(file.id)}')">
                             下载
@@ -184,7 +198,7 @@ async function loadFileList() {
             `).join('');
         }
     } catch (error) {
-        document.getElementById('fileList').innerHTML = 
+        document.getElementById('fileList').innerHTML =
             `<p class="empty-msg">加载失败: ${escapeHtml(error.message)}</p>`;
     } finally {
         hideLoading();
@@ -285,7 +299,7 @@ document.getElementById('authForm').addEventListener('submit', async (e) => {
             // 保存token和用户名到本地
             TokenManager.save(result.token, username);
             await updateUserBar();
-            loadFileList();
+            loadFileList(true);
             
             closeAuthModal();
             document.getElementById('loadingText').textContent = '验证成功，正在下载...';
@@ -373,6 +387,27 @@ function formatSize(bytes) {
 function formatTimestamp(timestamp) {
     if (!timestamp) return '永久有效';
     const date = new Date(timestamp * 1000);
+    return date.toLocaleString('zh-CN', {
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit'
+    });
+}
+
+// 格式化后端返回的创建时间（SQLite 以 UTC 存储，格式 "YYYY-MM-DD HH:MM:SS"）
+function formatDateTime(value) {
+    if (!value) return '未知';
+    let date;
+    if (typeof value === 'number') {
+        date = new Date(value * 1000);
+    } else if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}/.test(value) && !/[zZ]|[+-]\d{2}:?\d{2}$/.test(value)) {
+        date = new Date(value.replace(' ', 'T') + 'Z');
+    } else {
+        date = new Date(value);
+    }
+    if (isNaN(date.getTime())) return String(value);
     return date.toLocaleString('zh-CN', {
         year: 'numeric',
         month: '2-digit',
@@ -614,3 +649,347 @@ async function deleteShare(shareId) {
 }
 
 
+
+// ============================================================
+// 文件预览与元数据
+//
+// 设计要点：
+// - 入口由 hash 路由统一管理：#/file/<id> 为预览页，其余为文件目录；
+// - seq 序号 + AbortController 双重保证：连续打开不同文件时，
+//   过期响应一律丢弃、在途请求一律中断，绝不残留上一份结果；
+// - 读取中断/失败后保留当前位置（文件、元数据、滚动位置），仅重试内容请求；
+// - 每次进入预览页都重新请求元数据，目录数据变化后看到的始终是最新状态；
+// - 返回目录时强制刷新列表，入口、详情、空态信息保持一致。
+// ============================================================
+const PreviewController = {
+    fileId: null,
+    meta: null,
+    metaLoading: false,
+    seq: 0,
+    metaAbort: null,
+    previewAbort: null,
+    contentScrollY: 0,
+
+    // ---- 路由 ----
+    handleRoute() {
+        const match = window.location.hash.match(/^#\/file\/(.+)$/);
+        if (match) {
+            this.enterPreview(decodeURIComponent(match[1]));
+        } else {
+            this.enterDirectory();
+        }
+    },
+
+    enterDirectory() {
+        // 离开预览页：取消一切在途请求并清空内容，杜绝上一份结果残留
+        this.abortAll();
+        this.fileId = null;
+        this.meta = null;
+        this.seq++;
+        this.resetPreviewDom();
+
+        document.getElementById('previewView').style.display = 'none';
+        document.getElementById('directoryView').style.display = '';
+        // 目录数据可能在预览期间发生变化，返回时强制刷新
+        loadFileList(true);
+    },
+
+    enterPreview(fileId) {
+        // 同一文件重复进入（重复路由事件 / 再次点击入口）：
+        // - 已有元数据：后台静默刷新，保证与目录数据一致；
+        // - 元数据仍在加载：不中断、不重复请求，等待在途结果。
+        if (this.fileId === fileId) {
+            if (this.meta && !this.metaLoading) this.loadMeta({ silent: true });
+            return;
+        }
+        // 切换文件：中断上一份文件的所有请求并重置展示状态
+        this.abortAll();
+        this.fileId = fileId;
+        this.meta = null;
+        this.contentScrollY = 0;
+        this.resetPreviewDom();
+        this.showMetaState('loading');
+
+        document.getElementById('directoryView').style.display = 'none';
+        document.getElementById('previewView').style.display = '';
+        window.scrollTo(0, 0);
+
+        this.loadMeta();
+    },
+
+    // ---- 状态切换 ----
+    showMetaState(state) {
+        document.getElementById('previewMetaLoading').style.display = state === 'loading' ? '' : 'none';
+        document.getElementById('previewMissing').style.display = state === 'missing' ? '' : 'none';
+        document.getElementById('previewMetaError').style.display = state === 'error' ? '' : 'none';
+        document.getElementById('previewBody').style.display = state === 'ready' ? '' : 'none';
+    },
+
+    showContentState(state) {
+        document.getElementById('previewContentLoading').style.display = state === 'loading' ? '' : 'none';
+        document.getElementById('previewContentError').style.display = state === 'error' ? '' : 'none';
+        document.getElementById('previewContent').style.display = state === 'ready' ? '' : 'none';
+    },
+
+    resetPreviewDom() {
+        // 清掉上一份文件的全部痕迹：文本、媒体节点、失败说明、按钮
+        const content = document.getElementById('previewContent');
+        content.innerHTML = '';
+        content.scrollTop = 0;
+        document.getElementById('previewName').textContent = '';
+        document.getElementById('previewSummary').textContent = '';
+        document.getElementById('previewErrorMsg').textContent = '';
+        document.getElementById('previewRetryBtn').onclick = null;
+        document.getElementById('previewRetryBtn').style.display = '';
+        this.showContentState('hidden');
+    },
+
+    // ---- 元数据 ----
+    async loadMeta({ silent = false } = {}) {
+        const mySeq = ++this.seq;
+        this.metaLoading = true;
+        this.metaAbort = new AbortController();
+        if (!silent) this.showMetaState('loading');
+
+        try {
+            const response = await fetch(`${API_BASE}/files/${encodeURIComponent(this.fileId)}/meta`, {
+                signal: this.metaAbort.signal
+            });
+            if (mySeq !== this.seq) return; // 已切换到其他文件/目录
+
+            if (response.status === 404) {
+                const result = await response.json().catch(() => ({}));
+                document.getElementById('previewMissingMsg').textContent =
+                    result.error || '该文件已被删除，请返回文件目录查看最新文件。';
+                this.showMetaState('missing');
+                return;
+            }
+            if (!response.ok) {
+                throw new Error(`服务暂时不可用（HTTP ${response.status}）`);
+            }
+
+            const meta = await response.json();
+            // 与目录入口保持一致：分享操作仅对已登录（token 有效）用户开放
+            meta.is_logged_in = !!(TokenManager.get() && await TokenManager.isValid());
+            this.meta = meta;
+            this.renderMeta(meta);
+            this.showMetaState('ready');
+
+            // 磁盘数据缺失时不再请求预览内容，直接展示失败说明
+            if (!meta.available) {
+                this.renderContentError('文件数据缺失，可能已被移动或删除。请重新上传或联系管理员。', false);
+                return;
+            }
+            // 静默刷新时若内容已在展示，则保持现状与滚动位置，不重复读取
+            const contentReady = document.getElementById('previewContent').style.display !== 'none';
+            if (!silent || !contentReady) this.loadPreview();
+        } catch (error) {
+            if (error.name === 'AbortError' || mySeq !== this.seq) return;
+            // 静默刷新失败时保留当前已展示内容，不打断用户；首次加载才进入错误态
+            if (silent && this.meta) return;
+            this.meta = null;
+            document.getElementById('previewMetaErrorMsg').textContent =
+                `无法获取文件信息：${error.message}。请检查网络后重试。`;
+            this.showMetaState('error');
+        } finally {
+            if (mySeq === this.seq) {
+                this.metaAbort = null;
+                this.metaLoading = false;
+            }
+        }
+    },
+
+    // 元数据加载失败重试：保留在当前文件位置，仅重新请求
+    retryMeta() {
+        if (!this.fileId) return;
+        this.loadMeta();
+    },
+
+    renderMeta(meta) {
+        document.getElementById('previewFileIcon').textContent = getFileIcon(meta.name);
+        document.getElementById('previewName').textContent = meta.name;
+        document.getElementById('previewSizeLine').textContent = formatSize(meta.size);
+        document.getElementById('previewType').textContent = meta.file_type;
+        document.getElementById('previewCreatedAt').textContent = formatDateTime(meta.uploaded_at);
+        document.getElementById('previewSize').textContent = formatSize(meta.size);
+        document.getElementById('previewSummary').textContent = meta.summary;
+        this.renderActions(meta);
+    },
+
+    renderActions(meta) {
+        const wrap = document.getElementById('previewActions');
+        const actions = [];
+
+        if (meta.actions.download) {
+            actions.push(`<button class="download-btn" onclick="requestDownload('${escapeHtml(meta.id)}')">下载</button>`);
+        }
+        if (meta.actions.share && meta.is_logged_in) {
+            actions.push(`<button class="share-btn" onclick="openShareModal('${escapeHtml(meta.id)}', '${escapeHtml(meta.name)}')">分享</button>`);
+        }
+        if (!actions.length) {
+            wrap.innerHTML = '<span class="empty-msg" style="padding: 8px;">当前文件暂无可执行的操作</span>';
+            return;
+        }
+        wrap.innerHTML = actions.join('');
+    },
+
+    // ---- 预览内容 ----
+    async loadPreview() {
+        const mySeq = this.seq;
+        this.previewAbort = new AbortController();
+        // 重试时记住内容区当前滚动位置，渲染后恢复（保留当前位置）
+        const contentBox = document.getElementById('previewContent');
+        this.contentScrollY = contentBox.scrollTop;
+        this.showContentState('loading');
+
+        try {
+            const response = await fetch(`${API_BASE}/files/${encodeURIComponent(this.fileId)}/preview`, {
+                signal: this.previewAbort.signal
+            });
+            if (mySeq !== this.seq) return;
+
+            const result = await response.json().catch(() => ({}));
+
+            if (response.status === 404 || response.status === 410) {
+                // 读取时数据已变化（文件被删除/移动）：同步本地元数据状态并给出说明
+                if (this.meta) {
+                    this.meta.available = false;
+                    this.meta.previewable = false;
+                    this.meta.actions = { download: false, preview: false, share: false };
+                    this.meta.summary = '文件数据缺失，可能已被移动或删除';
+                    this.renderMeta(this.meta);
+                }
+                this.renderContentError(result.error || '文件数据缺失，可能已被移动或删除。', false);
+                return;
+            }
+            if (response.status === 422) {
+                // 类型不支持在线预览：展示后端给出的失败说明，不提供“重试读取”
+                this.renderContentError(result.error || '该文件暂不支持在线预览。', false);
+                return;
+            }
+            if (!response.ok) {
+                throw new Error(result.error || `HTTP ${response.status}`);
+            }
+
+            this.renderPayload(result);
+            this.showContentState('ready');
+            contentBox.scrollTop = this.contentScrollY;
+        } catch (error) {
+            if (error.name === 'AbortError' || mySeq !== this.seq) return;
+            // 网络中断等：保留元数据与当前位置，允许原地重试
+            this.renderContentError(`内容读取失败：${error.message}。`, true);
+        } finally {
+            if (mySeq === this.seq) this.previewAbort = null;
+        }
+    },
+
+    // 内容读取失败重试：元数据与位置不变，仅重试内容请求
+    retryPreview() {
+        if (!this.meta) {
+            this.loadMeta();
+            return;
+        }
+        this.loadPreview();
+    },
+
+    renderContentError(message, retryable) {
+        document.getElementById('previewErrorMsg').textContent = message;
+        document.getElementById('previewErrorIcon').textContent = retryable ? '📡' : '⚠️';
+        const btn = document.getElementById('previewRetryBtn');
+        btn.style.display = retryable ? '' : 'none';
+        btn.onclick = () => this.retryPreview();
+        this.showContentState('error');
+    },
+
+    renderPayload(data) {
+        const box = document.getElementById('previewContent');
+        box.innerHTML = '';
+        const payload = data.payload || {};
+        // content_url 为相对路径（/api/...），本地开发时需拼上后端源地址
+        const apiOrigin = API_BASE.endsWith('/api') ? API_BASE.slice(0, -4) : API_BASE;
+        const url = data.content_url && data.content_url.startsWith('http')
+            ? data.content_url
+            : `${apiOrigin}${data.content_url}`;
+
+        switch (payload.kind) {
+            case 'text': {
+                const pre = document.createElement('pre');
+                pre.className = 'preview-text';
+                pre.textContent = payload.content;
+                box.appendChild(pre);
+                if (payload.truncated) {
+                    const hint = document.createElement('p');
+                    hint.className = 'preview-truncate-hint';
+                    hint.textContent = '文件较长，仅展示开头部分，完整内容请下载查看。';
+                    box.appendChild(hint);
+                }
+                break;
+            }
+            case 'image': {
+                const img = document.createElement('img');
+                img.className = 'preview-image';
+                img.src = url;
+                img.alt = this.meta ? this.meta.name : '图片预览';
+                box.appendChild(img);
+                img.addEventListener('error', () => {
+                    if (this.seq) this.renderContentError('图片加载失败，文件可能已损坏。', true);
+                }, { once: true });
+                break;
+            }
+            case 'pdf': {
+                const frame = document.createElement('iframe');
+                frame.className = 'preview-frame';
+                frame.src = url;
+                frame.title = 'PDF 预览';
+                box.appendChild(frame);
+                break;
+            }
+            case 'audio': {
+                const audio = document.createElement('audio');
+                audio.controls = true;
+                audio.src = url;
+                box.appendChild(audio);
+                break;
+            }
+            case 'video': {
+                const video = document.createElement('video');
+                video.controls = true;
+                video.className = 'preview-video';
+                video.src = url;
+                box.appendChild(video);
+                break;
+            }
+            default:
+                this.renderContentError('该文件暂不支持在线预览，请下载后查看。', false);
+        }
+    },
+
+    abortAll() {
+        if (this.metaAbort) {
+            this.metaAbort.abort();
+            this.metaAbort = null;
+        }
+        if (this.previewAbort) {
+            this.previewAbort.abort();
+            this.previewAbort = null;
+        }
+        // 停止仍在加载的媒体资源，避免离开后继续占用连接
+        document.querySelectorAll('#previewContent img, #previewContent audio, #previewContent video, #previewContent iframe')
+            .forEach(el => { el.src = ''; });
+    }
+};
+
+// 从文件目录进入预览页
+function openPreview(fileId) {
+    window.location.hash = `#/file/${fileId}`;
+}
+
+// 返回文件目录：清空 hash 触发路由切换，并强制刷新保证与最新目录数据一致
+function backToDirectory() {
+    // history.back() 在无历史记录时不会触发任何事件，统一用 hash 跳转更可靠
+    if (window.location.hash) {
+        window.location.hash = '';
+    } else {
+        PreviewController.enterDirectory();
+    }
+}

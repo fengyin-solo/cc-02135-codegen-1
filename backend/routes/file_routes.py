@@ -10,6 +10,7 @@ from routes import files_bp
 from database import get_db
 from auth import verify_token, get_username_from_token, login_required
 from config import UPLOAD_FOLDER, MAX_FILE_SIZE, BLOCKED_EXTENSIONS, SHARE_LINK_EXPIRE_HOURS, SHARE_LINK_MAX_DOWNLOADS
+import file_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +21,23 @@ def allowed_file(filename):
         return False
     ext = filename.rsplit('.', 1)[1].lower()
     return ext not in BLOCKED_EXTENSIONS
+
+
+def _get_file_record(file_id):
+    """按 ID 查询文件记录，不存在返回 None"""
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute('SELECT id, name, path, size, uploaded_at FROM files WHERE id = ?', (file_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row
+
+
+def _file_exists_on_disk(file_info):
+    """校验文件路径合法且磁盘文件存在"""
+    if not os.path.abspath(file_info['path']).startswith(os.path.abspath(UPLOAD_FOLDER)):
+        return False
+    return os.path.exists(file_info['path'])
 
 
 @files_bp.route('/api/upload', methods=['POST'])
@@ -72,7 +90,7 @@ def upload_file():
 def list_files():
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute('SELECT id, name, path, size FROM files')
+    cursor.execute('SELECT id, name, path, size, uploaded_at FROM files ORDER BY uploaded_at DESC, id DESC')
     files = [dict(row) for row in cursor.fetchall()]
     conn.close()
     return jsonify(files)
@@ -107,6 +125,97 @@ def download_file(file_id):
 
     logger.info(f"文件下载: {file_info['name']} (ID: {file_id})")
     return send_file(file_info['path'], as_attachment=True, download_name=file_info['name'])
+
+
+@files_bp.route('/api/files/<file_id>/meta', methods=['GET'])
+def file_meta(file_id):
+    """获取文件元数据（类型、创建时间、摘要、可用操作）
+
+    目录数据变化后重新进入时，始终以数据库 + 磁盘当前状态为准。
+    """
+    file_info = _get_file_record(file_id)
+    if not file_info:
+        return jsonify({'error': '文件不存在或已被删除'}), 404
+
+    exists = _file_exists_on_disk(file_info)
+    category, type_name, previewable, unsupported_msg = file_metadata.get_type_info(file_info['name'])
+
+    summary = file_metadata.build_summary(file_info['name'], file_info['path'], file_info['size']) if exists \
+        else '文件数据缺失，可能已被移动或删除'
+
+    return jsonify({
+        'id': file_info['id'],
+        'name': file_info['name'],
+        'size': file_info['size'],
+        'uploaded_at': file_info['uploaded_at'],
+        'category': category,
+        'file_type': type_name,
+        'previewable': previewable and exists,
+        'unsupported_msg': unsupported_msg,
+        'summary': summary,
+        'available': exists,
+        'actions': {
+            'download': exists,
+            'preview': previewable and exists,
+            'share': exists
+        }
+    })
+
+
+@files_bp.route('/api/files/<file_id>/preview', methods=['GET'])
+def file_preview(file_id):
+    """获取文件预览内容（只读、不增加下载计数、不要求鉴权，与文件列表一致）"""
+    file_info = _get_file_record(file_id)
+    if not file_info:
+        return jsonify({'error': '文件不存在或已被删除'}), 404
+
+    if not _file_exists_on_disk(file_info):
+        return jsonify({'error': '文件数据缺失，可能已被移动或删除'}), 410
+
+    previewable, unsupported_msg, payload = file_metadata.build_preview(
+        file_info['name'], file_info['path']
+    )
+    if not previewable:
+        return jsonify({
+            'id': file_info['id'],
+            'name': file_info['name'],
+            'previewable': False,
+            'error': unsupported_msg or '该文件暂不支持在线预览'
+        }), 422
+
+    return jsonify({
+        'id': file_info['id'],
+        'name': file_info['name'],
+        'previewable': True,
+        'content_url': f'/api/files/{file_id}/content',
+        'payload': payload
+    })
+
+
+@files_bp.route('/api/files/<file_id>/content', methods=['GET'])
+def file_content(file_id):
+    """以内联方式返回可预览文件的原始内容（图片/PDF/音视频），并施加严格 CSP"""
+    file_info = _get_file_record(file_id)
+    if not file_info:
+        return jsonify({'error': '文件不存在或已被删除'}), 404
+
+    if not os.path.abspath(file_info['path']).startswith(os.path.abspath(UPLOAD_FOLDER)):
+        return jsonify({'error': '非法文件路径'}), 403
+
+    if not os.path.exists(file_info['path']):
+        return jsonify({'error': '文件数据缺失，可能已被移动或删除'}), 410
+
+    response = send_file(
+        file_info['path'],
+        as_attachment=False,
+        download_name=file_info['name'],
+        mimetype=file_metadata.guess_mime(file_info['name'])
+    )
+    # 内联内容禁止脚本执行，防止上传的 HTML/SVG 引发 XSS
+    response.headers['Content-Security-Policy'] = "default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'none'"
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    return response
 
 
 def generate_short_id():
